@@ -1,0 +1,502 @@
+name: Build Flutter Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_type:
+        description: "Flutter source type"
+        required: true
+        default: tag
+        type: choice
+        options:
+          - tag
+          - commit
+
+      source:
+        description: "Flutter tag (e.g. 3.35.4) or full 40-character commit SHA"
+        required: true
+        type: string
+
+      publish_release:
+        description: "Publish GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------
+  # Resolve Flutter tag <-> commit and check whether the release
+  # already exists BEFORE starting any expensive engine build.
+  # ------------------------------------------------------------
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+
+    outputs:
+      flutter_tag: ${{ steps.resolve.outputs.flutter_tag }}
+      flutter_commit: ${{ steps.resolve.outputs.flutter_commit }}
+
+    steps:
+      - name: Resolve Flutter tag and commit
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_TYPE: ${{ inputs.source_type }}
+          SOURCE: ${{ inputs.source }}
+        run: |
+          set -euo pipefail
+
+          FLUTTER_REMOTE="https://github.com/flutter/flutter.git"
+
+          echo "Source type: $SOURCE_TYPE"
+          echo "Source:      $SOURCE"
+          echo
+          echo "Fetching Flutter tag references..."
+
+          git ls-remote --tags "$FLUTTER_REMOTE" > /tmp/flutter-tags.txt
+
+          python3 - "$SOURCE_TYPE" "$SOURCE" \
+            /tmp/flutter-tags.txt "$GITHUB_OUTPUT" <<'PY'
+          import re
+          import sys
+
+          source_type = sys.argv[1]
+          source = sys.argv[2].strip()
+          tags_file = sys.argv[3]
+          output_file = sys.argv[4]
+
+          direct = {}
+          peeled = {}
+
+          with open(tags_file, encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+
+                  sha, ref = line.split(None, 1)
+
+                  prefix = "refs/tags/"
+                  if not ref.startswith(prefix):
+                      continue
+
+                  tag = ref[len(prefix):]
+
+                  if tag.endswith("^{}"):
+                      peeled[tag[:-3]] = sha.lower()
+                  else:
+                      direct[tag] = sha.lower()
+
+          # For annotated tags, use the peeled commit.
+          # For lightweight tags, the tag ref itself is the commit.
+          resolved = {
+              tag: peeled.get(tag, sha)
+              for tag, sha in direct.items()
+          }
+
+          if source_type == "tag":
+              tag = source
+
+              if tag.startswith("refs/tags/"):
+                  tag = tag[len("refs/tags/"):]
+
+              if tag not in resolved:
+                  print(
+                      f"::error::Flutter tag '{tag}' does not exist.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              commit = resolved[tag]
+
+          elif source_type == "commit":
+              commit = source.lower()
+
+              if not re.fullmatch(r"[0-9a-f]{40}", commit):
+                  print(
+                      "::error::Commit must be a full 40-character SHA.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              matches = sorted(
+                  tag
+                  for tag, tag_commit in resolved.items()
+                  if tag_commit == commit
+              )
+
+              if not matches:
+                  print(
+                      f"::error::Flutter commit '{commit}' does not "
+                      "correspond to any Flutter tag.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              # Prefer Flutter version-looking tags if the commit happens
+              # to have other unrelated tag names as well.
+              version_matches = [
+                  tag
+                  for tag in matches
+                  if re.fullmatch(
+                      r"\d+\.\d+\.\d+(?:[-+].+)?",
+                      tag,
+                  )
+              ]
+
+              candidates = version_matches or matches
+
+              if len(candidates) != 1:
+                  print(
+                      "::error::The commit corresponds to multiple "
+                      "possible Flutter tags:",
+                      file=sys.stderr,
+                  )
+
+                  for candidate in candidates:
+                      print(
+                          f"  - {candidate}",
+                          file=sys.stderr,
+                      )
+
+                  print(
+                      "::error::Use source_type=tag to select one explicitly.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+              tag = candidates[0]
+
+          else:
+              print(
+                  f"::error::Unknown source type '{source_type}'.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print()
+          print("Resolved Flutter source:")
+          print(f"  tag:    {tag}")
+          print(f"  commit: {commit}")
+
+          with open(output_file, "a", encoding="utf-8") as f:
+              f.write(f"flutter_tag={tag}\n")
+              f.write(f"flutter_commit={commit}\n")
+          PY
+
+      - name: Show resolved source
+        shell: bash
+        env:
+          FLUTTER_TAG: ${{ steps.resolve.outputs.flutter_tag }}
+          FLUTTER_COMMIT: ${{ steps.resolve.outputs.flutter_commit }}
+        run: |
+          echo "Flutter tag:    $FLUTTER_TAG"
+          echo "Flutter commit: $FLUTTER_COMMIT"
+
+      # This runs BEFORE the build jobs.
+      #
+      # If a GitHub Release already exists for this Flutter tag,
+      # fail immediately so we don't waste CI time compiling.
+      - name: Check release does not already exist
+        if: ${{ inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.flutter_tag }}
+        run: |
+          set -euo pipefail
+
+          echo "Checking GitHub Release '$RELEASE_TAG'..."
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1
+          then
+            echo
+            echo "::error::GitHub Release '$RELEASE_TAG' already exists."
+            echo "::error::Build aborted before compilation."
+            exit 1
+          fi
+
+          echo "Release '$RELEASE_TAG' does not exist."
+          echo "Preflight passed."
+
+  # ------------------------------------------------------------
+  # Build debug / profile / release in parallel.
+  #
+  # This job cannot start unless preflight succeeds.
+  # ------------------------------------------------------------
+  build:
+    name: Linux x64 ${{ matrix.mode }}
+    needs: preflight
+
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - mode: debug
+            config: host_debug
+            out_dir: host_debug
+
+          - mode: profile
+            config: host_profile
+            out_dir: host_profile
+
+          - mode: release
+            config: host_release
+            out_dir: host_release
+
+    steps:
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Disk space before cleanup:"
+          df -h /
+
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+          sudo apt-get clean
+
+          echo
+          echo "Disk space after cleanup:"
+          df -h /
+
+      - name: Checkout Flutter
+        uses: actions/checkout@v4
+        with:
+          repository: flutter/flutter
+          ref: ${{ needs.preflight.outputs.flutter_commit }}
+          path: flutter
+          fetch-depth: 1
+
+      - name: Verify Flutter commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.preflight.outputs.flutter_commit }}
+          FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+        run: |
+          set -euo pipefail
+
+          cd flutter
+
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+
+          echo "Flutter tag:      $FLUTTER_TAG"
+          echo "Expected commit:  $EXPECTED_COMMIT"
+          echo "Checked-out HEAD: $ACTUAL_COMMIT"
+
+          if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]]; then
+            echo "::error::Checked-out Flutter commit does not match preflight."
+            exit 1
+          fi
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            curl \
+            unzip
+
+      - name: Setup depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth=1 \
+            https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+            "$HOME/depot_tools"
+
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Setup gclient
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cp \
+            flutter/engine/scripts/standard.gclient \
+            flutter/.gclient
+
+          cd flutter
+
+          gclient sync \
+            --no-history \
+            -D
+
+      - name: Fetch Engine dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd flutter/engine/src
+
+          ./flutter/bin/et fetch
+
+      - name: Build Flutter Engine (${{ matrix.mode }})
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd flutter/engine/src
+
+          ./flutter/bin/et build \
+            --build-strategy=local \
+            --config "${{ matrix.config }}" \
+            //flutter/shell/platform/embedder:flutter_engine
+
+      - name: Collect libflutter_engine.so
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SRC="flutter/engine/src/out/${{ matrix.out_dir }}/libflutter_engine.so"
+          DST="dist/libflutter_engine-linux-x64-${{ matrix.mode }}.so"
+
+          if [[ ! -f "$SRC" ]]; then
+            echo "::error::libflutter_engine.so not found:"
+            echo "::error::$SRC"
+
+            echo
+            echo "Searching output directory..."
+
+            find \
+              "flutter/engine/src/out/${{ matrix.out_dir }}" \
+              -name 'libflutter_engine.so' \
+              -print \
+              2>/dev/null || true
+
+            exit 1
+          fi
+
+          mkdir -p dist
+
+          cp "$SRC" "$DST"
+
+          echo "Collected:"
+          ls -lh "$DST"
+
+          echo
+          file "$DST"
+
+          echo
+          sha256sum "$DST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-engine-linux-x64-${{ matrix.mode }}
+          path: dist/libflutter_engine-linux-x64-${{ matrix.mode }}.so
+          retention-days: 1
+          if-no-files-found: error
+
+  # ------------------------------------------------------------
+  # Release all three builds.
+  # ------------------------------------------------------------
+  release:
+    name: Publish Flutter ${{ needs.preflight.outputs.flutter_tag }}
+
+    needs:
+      - preflight
+      - build
+
+    if: ${{ inputs.publish_release }}
+
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: flutter-engine-linux-x64-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG="dist/libflutter_engine-linux-x64-debug.so"
+          PROFILE="dist/libflutter_engine-linux-x64-profile.so"
+          RELEASE="dist/libflutter_engine-linux-x64-release.so"
+
+          [[ -f "$DEBUG" ]]
+          [[ -f "$PROFILE" ]]
+          [[ -f "$RELEASE" ]]
+
+          echo "Release artifacts:"
+          ls -lh dist/
+
+          echo
+          echo "SHA256:"
+          sha256sum \
+            "$DEBUG" \
+            "$PROFILE" \
+            "$RELEASE"
+
+      # Defensive second check:
+      #
+      # Another workflow could theoretically create this release after
+      # preflight passed but before these builds finished.
+      - name: Check release again
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            >/dev/null 2>&1
+          then
+            echo "::error::GitHub Release '$RELEASE_TAG' already exists."
+            echo "::error::It was probably created while this workflow was building."
+            exit 1
+          fi
+
+          echo "Release '$RELEASE_TAG' is still available."
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+          FLUTTER_COMMIT: ${{ needs.preflight.outputs.flutter_commit }}
+        run: |
+          set -euo pipefail
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Flutter Engine $RELEASE_TAG" \
+            --notes "Flutter Engine builds for Linux x64.
+
+          Upstream Flutter:
+          - Tag: \`$RELEASE_TAG\`
+          - Commit: \`$FLUTTER_COMMIT\`
+
+          Included runtime modes:
+          - debug
+          - profile
+          - release" \
+            dist/libflutter_engine-linux-x64-debug.so \
+            dist/libflutter_engine-linux-x64-profile.so \
+            dist/libflutter_engine-linux-x64-release.so
