@@ -268,7 +268,7 @@ jobs:
           df -h /
 
       - name: Checkout Flutter
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: flutter/flutter
           ref: ${{ needs.preflight.outputs.flutter_commit }}
@@ -393,7 +393,7 @@ jobs:
           sha256sum "$DST"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flutter-engine-linux-x64-${{ matrix.mode }}
           path: dist/libflutter_engine-linux-x64-${{ matrix.mode }}.so
@@ -416,7 +416,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: flutter-engine-linux-x64-*
           path: dist
