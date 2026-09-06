@@ -196,10 +196,6 @@ jobs:
           echo "Flutter tag:    $FLUTTER_TAG"
           echo "Flutter commit: $FLUTTER_COMMIT"
 
-      # This runs BEFORE the build jobs.
-      #
-      # If a GitHub Release already exists for this Flutter tag,
-      # fail immediately so we don't waste CI time compiling.
       - name: Check release does not already exist
         if: ${{ inputs.publish_release }}
         shell: bash
@@ -226,8 +222,6 @@ jobs:
 
   # ------------------------------------------------------------
   # Build debug / profile / release in parallel.
-  #
-  # This job cannot start unless preflight succeeds.
   # ------------------------------------------------------------
   build:
     name: Linux x64 ${{ matrix.mode }}
@@ -407,7 +401,7 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------
-  # Release all three builds.
+  # Release all three builds and a combined tar.gz archive.
   # ------------------------------------------------------------
   release:
     name: Publish Flutter ${{ needs.preflight.outputs.flutter_tag }}
@@ -451,8 +445,39 @@ jobs:
             "$PROFILE" \
             "$RELEASE"
 
-      # Defensive second check:
+      # Create an archive suitable for Zig .zon URL dependencies.
       #
+      # The archive has no parent directory. Its root contains exactly:
+      #
+      #   libflutter_engine-linux-x64-debug.so
+      #   libflutter_engine-linux-x64-profile.so
+      #   libflutter_engine-linux-x64-release.so
+      #
+      - name: Create release archive
+        shell: bash
+        env:
+          FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+        run: |
+          set -euo pipefail
+
+          ARCHIVE="flutter-engine-linux-x64-${FLUTTER_TAG}.tar.gz"
+
+          tar -C dist -czf "$ARCHIVE" \
+            libflutter_engine-linux-x64-debug.so \
+            libflutter_engine-linux-x64-profile.so \
+            libflutter_engine-linux-x64-release.so
+
+          echo "Created archive:"
+          ls -lh "$ARCHIVE"
+
+          echo
+          echo "Archive contents:"
+          tar -tzf "$ARCHIVE"
+
+          echo
+          echo "Archive SHA256:"
+          sha256sum "$ARCHIVE"
+
       # Another workflow could theoretically create this release after
       # preflight passed but before these builds finished.
       - name: Check release again
@@ -483,6 +508,8 @@ jobs:
         run: |
           set -euo pipefail
 
+          ARCHIVE="flutter-engine-linux-x64-${RELEASE_TAG}.tar.gz"
+
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
@@ -497,6 +524,7 @@ jobs:
           - debug
           - profile
           - release" \
+            "$ARCHIVE" \
             dist/libflutter_engine-linux-x64-debug.so \
             dist/libflutter_engine-linux-x64-profile.so \
             dist/libflutter_engine-linux-x64-release.so
