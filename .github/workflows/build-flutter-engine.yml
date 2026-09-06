@@ -28,8 +28,9 @@ permissions:
 
 jobs:
   # ------------------------------------------------------------
-  # Resolve Flutter tag <-> commit and check whether the release
-  # already exists BEFORE starting any expensive engine build.
+  # Resolve Flutter tag <-> commit and Engine revision, then check
+  # whether the Engine release already exists BEFORE starting any
+  # expensive engine build.
   # ------------------------------------------------------------
   preflight:
     name: Preflight
@@ -38,6 +39,8 @@ jobs:
     outputs:
       flutter_tag: ${{ steps.resolve.outputs.flutter_tag }}
       flutter_commit: ${{ steps.resolve.outputs.flutter_commit }}
+      engine_revision: ${{ steps.engine.outputs.engine_revision }}
+      release_tag: ${{ steps.engine.outputs.release_tag }}
 
     steps:
       - name: Resolve Flutter tag and commit
@@ -187,21 +190,60 @@ jobs:
               f.write(f"flutter_commit={commit}\n")
           PY
 
+      - name: Resolve Engine revision
+        id: engine
+        shell: bash
+        env:
+          FLUTTER_COMMIT: ${{ steps.resolve.outputs.flutter_commit }}
+        run: |
+          set -euo pipefail
+
+          ENGINE_VERSION_URL="https://raw.githubusercontent.com/flutter/flutter/${FLUTTER_COMMIT}/bin/internal/engine.version"
+
+          ENGINE_REVISION="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              "$ENGINE_VERSION_URL" \
+              | tr -d '[:space:]'
+          )"
+
+          if [[ ! "$ENGINE_REVISION" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid Flutter Engine revision: '$ENGINE_REVISION'"
+            exit 1
+          fi
+
+          ENGINE_REVISION="${ENGINE_REVISION,,}"
+          RELEASE_TAG="engine-${ENGINE_REVISION}"
+
+          echo "Engine revision: $ENGINE_REVISION"
+          echo "Release tag:     $RELEASE_TAG"
+
+          echo "engine_revision=$ENGINE_REVISION" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Show resolved source
         shell: bash
         env:
           FLUTTER_TAG: ${{ steps.resolve.outputs.flutter_tag }}
           FLUTTER_COMMIT: ${{ steps.resolve.outputs.flutter_commit }}
+          ENGINE_REVISION: ${{ steps.engine.outputs.engine_revision }}
+          RELEASE_TAG: ${{ steps.engine.outputs.release_tag }}
         run: |
-          echo "Flutter tag:    $FLUTTER_TAG"
-          echo "Flutter commit: $FLUTTER_COMMIT"
+          echo "Flutter tag:     $FLUTTER_TAG"
+          echo "Flutter commit:  $FLUTTER_COMMIT"
+          echo "Engine revision: $ENGINE_REVISION"
+          echo "Release tag:     $RELEASE_TAG"
 
       - name: Check release does not already exist
         if: ${{ inputs.publish_release }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.resolve.outputs.flutter_tag }}
+          RELEASE_TAG: ${{ steps.engine.outputs.release_tag }}
         run: |
           set -euo pipefail
 
@@ -275,10 +317,11 @@ jobs:
           path: flutter
           fetch-depth: 1
 
-      - name: Verify Flutter commit
+      - name: Verify Flutter source
         shell: bash
         env:
           EXPECTED_COMMIT: ${{ needs.preflight.outputs.flutter_commit }}
+          EXPECTED_ENGINE_REVISION: ${{ needs.preflight.outputs.engine_revision }}
           FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
         run: |
           set -euo pipefail
@@ -286,13 +329,21 @@ jobs:
           cd flutter
 
           ACTUAL_COMMIT="$(git rev-parse HEAD)"
+          ACTUAL_ENGINE_REVISION="$(tr -d '[:space:]' < bin/internal/engine.version)"
 
-          echo "Flutter tag:      $FLUTTER_TAG"
-          echo "Expected commit:  $EXPECTED_COMMIT"
-          echo "Checked-out HEAD: $ACTUAL_COMMIT"
+          echo "Flutter tag:              $FLUTTER_TAG"
+          echo "Expected Flutter commit:  $EXPECTED_COMMIT"
+          echo "Checked-out HEAD:         $ACTUAL_COMMIT"
+          echo "Expected Engine revision: $EXPECTED_ENGINE_REVISION"
+          echo "Checked-out Engine:       $ACTUAL_ENGINE_REVISION"
 
           if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]]; then
             echo "::error::Checked-out Flutter commit does not match preflight."
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_ENGINE_REVISION" != "$EXPECTED_ENGINE_REVISION" ]]; then
+            echo "::error::Checked-out Engine revision does not match preflight."
             exit 1
           fi
 
@@ -401,7 +452,8 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------
-  # Release all three builds and a combined tar.gz archive.
+  # Publish the three builds plus a self-contained metadata file.
+  # The GitHub Release tag is keyed by Flutter Engine revision.
   # ------------------------------------------------------------
   release:
     name: Publish Flutter ${{ needs.preflight.outputs.flutter_tag }}
@@ -445,38 +497,94 @@ jobs:
             "$PROFILE" \
             "$RELEASE"
 
-      # Create an archive suitable for Zig .zon URL dependencies.
-      #
-      # The archive has no parent directory. Its root contains exactly:
-      #
-      #   libflutter_engine-linux-x64-debug.so
-      #   libflutter_engine-linux-x64-profile.so
-      #   libflutter_engine-linux-x64-release.so
-      #
-      - name: Create release archive
+      - name: Resolve Dart version
+        id: dart
         shell: bash
         env:
-          FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+          ENGINE_REVISION: ${{ needs.preflight.outputs.engine_revision }}
         run: |
           set -euo pipefail
 
-          ARCHIVE="flutter-engine-linux-x64-${FLUTTER_TAG}.tar.gz"
+          DART_SDK_URL="https://storage.googleapis.com/flutter_infra_release/flutter/${ENGINE_REVISION}/dart-sdk-linux-x64.zip"
+          DART_SDK_ZIP="${RUNNER_TEMP}/dart-sdk-linux-x64.zip"
 
-          tar -C dist -czf "$ARCHIVE" \
-            libflutter_engine-linux-x64-debug.so \
-            libflutter_engine-linux-x64-profile.so \
-            libflutter_engine-linux-x64-release.so
+          echo "Reading Dart SDK version for Engine $ENGINE_REVISION..."
 
-          echo "Created archive:"
-          ls -lh "$ARCHIVE"
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --output "$DART_SDK_ZIP" \
+            "$DART_SDK_URL"
+
+          DART_VERSION="$(
+            unzip -p "$DART_SDK_ZIP" dart-sdk/version \
+              | tr -d '\r\n[:space:]'
+          )"
+
+          if [[ -z "$DART_VERSION" ]]; then
+            echo "::error::Unable to determine Dart SDK version."
+            exit 1
+          fi
+
+          echo "Dart version: $DART_VERSION"
+          echo "dart_version=$DART_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create metadata
+        shell: bash
+        env:
+          ENGINE_REVISION: ${{ needs.preflight.outputs.engine_revision }}
+          FLUTTER_VERSION: ${{ needs.preflight.outputs.flutter_tag }}
+          DART_VERSION: ${{ steps.dart.outputs.dart_version }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          dist = Path("dist")
+
+          artifacts = {}
+          for mode in ("debug", "profile", "release"):
+              filename = f"libflutter_engine-linux-x64-{mode}.so"
+              path = dist / filename
+
+              digest = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      digest.update(chunk)
+
+              artifacts[mode] = {
+                  "file": filename,
+                  "sha256": digest.hexdigest(),
+              }
+
+          metadata = {
+              "schema": 1,
+              "engine_revision": os.environ["ENGINE_REVISION"],
+              "flutter_version": os.environ["FLUTTER_VERSION"],
+              "dart_version": os.environ["DART_VERSION"],
+              "artifacts": {
+                  "x86_64": artifacts,
+              },
+          }
+
+          with open("metadata.json", "w", encoding="utf-8") as f:
+              json.dump(metadata, f, indent=2)
+              f.write("\n")
+          PY
+
+          echo "metadata.json:"
+          cat metadata.json
 
           echo
-          echo "Archive contents:"
-          tar -tzf "$ARCHIVE"
-
-          echo
-          echo "Archive SHA256:"
-          sha256sum "$ARCHIVE"
+          echo "Metadata SHA256:"
+          sha256sum metadata.json
 
       # Another workflow could theoretically create this release after
       # preflight passed but before these builds finished.
@@ -484,7 +592,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
         run: |
           set -euo pipefail
 
@@ -503,28 +611,31 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.preflight.outputs.flutter_tag }}
-          FLUTTER_COMMIT: ${{ needs.preflight.outputs.flutter_commit }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
+          ENGINE_REVISION: ${{ needs.preflight.outputs.engine_revision }}
+          DART_VERSION: ${{ steps.dart.outputs.dart_version }}
         run: |
           set -euo pipefail
 
-          ARCHIVE="flutter-engine-linux-x64-${RELEASE_TAG}.tar.gz"
+          ENGINE_SHORT="${ENGINE_REVISION:0:12}"
 
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "Flutter Engine $RELEASE_TAG" \
-            --notes "Flutter Engine builds for Linux x64.
+            --title "Flutter Engine $ENGINE_SHORT (Flutter $FLUTTER_TAG)" \
+            --notes "Flutter Engine builds for Linux.
 
-          Upstream Flutter:
-          - Tag: \`$RELEASE_TAG\`
-          - Commit: \`$FLUTTER_COMMIT\`
+          - Engine revision: \`$ENGINE_REVISION\`
+          - Flutter version: \`$FLUTTER_TAG\`
+          - Dart version: \`$DART_VERSION\`
+          - Architecture: \`x86_64\`
 
           Included runtime modes:
           - debug
           - profile
           - release" \
-            "$ARCHIVE" \
+            metadata.json \
             dist/libflutter_engine-linux-x64-debug.so \
             dist/libflutter_engine-linux-x64-profile.so \
             dist/libflutter_engine-linux-x64-release.so
