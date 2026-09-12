@@ -23,8 +23,18 @@ on:
         default: false
         type: boolean
 
+      replace_existing:
+        description: "Replace metadata for an existing Engine release (retains old libraries)"
+        required: true
+        default: false
+        type: boolean
+
 permissions:
   contents: write
+
+concurrency:
+  group: flutter-engine-release
+  cancel-in-progress: false
 
 jobs:
   # ------------------------------------------------------------
@@ -238,29 +248,23 @@ jobs:
           echo "Engine revision: $ENGINE_REVISION"
           echo "Release tag:     $RELEASE_TAG"
 
-      - name: Check release does not already exist
+      - name: Check existing release policy
         if: ${{ inputs.publish_release }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.engine.outputs.release_tag }}
+          REPLACE_EXISTING: ${{ inputs.replace_existing }}
         run: |
           set -euo pipefail
-
-          echo "Checking GitHub Release '$RELEASE_TAG'..."
-
-          if gh release view "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            >/dev/null 2>&1
-          then
-            echo
-            echo "::error::GitHub Release '$RELEASE_TAG' already exists."
-            echo "::error::Build aborted before compilation."
+          # API/auth failures must stop preflight, not imply a missing release.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > /tmp/releases.json
+          count="$(jq -s --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | length' /tmp/releases.json)"
+          if [[ "$count" != 0 && "$REPLACE_EXISTING" != true ]]; then
+            echo "::error::Release $RELEASE_TAG exists; set replace_existing to replace its metadata, or disable publish_release for artifacts only."
             exit 1
           fi
-
-          echo "Release '$RELEASE_TAG' does not exist."
-          echo "Preflight passed."
+          echo "Preflight passed for $RELEASE_TAG (replace_existing=$REPLACE_EXISTING)."
 
   # ------------------------------------------------------------
   # Build debug / profile / release in parallel.
@@ -357,7 +361,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             curl \
-            unzip
+            unzip \
+            libfontconfig1-dev \
+            binutils \
+            file
 
       - name: Setup depot_tools
         shell: bash
@@ -404,7 +411,33 @@ jobs:
           ./flutter/bin/et build \
             --build-strategy=local \
             --config "${{ matrix.config }}" \
+            --gn-args=--enable-fontconfig \
             //flutter/shell/platform/embedder:flutter_engine
+
+      - name: Verify Fontconfig linkage and embedder API
+        shell: bash
+        env:
+          ENGINE_SO: flutter/engine/src/out/${{ matrix.out_dir }}/libflutter_engine.so
+        run: |
+          set -euo pipefail
+          # Inspect the ELF itself, not just the requested GN arguments.
+          readelf --dynamic "$ENGINE_SO" > /tmp/engine-dynamic.txt
+          grep -E '\(NEEDED\).*\[libfontconfig\.so\.[^]]+\]' /tmp/engine-dynamic.txt
+          nm --dynamic --undefined-only "$ENGINE_SO" > /tmp/engine-imports.txt
+          grep -E '[[:space:]]Fc[A-Za-z0-9_]+(@[^ ]*)?$' /tmp/engine-imports.txt
+          nm --dynamic --defined-only "$ENGINE_SO" > /tmp/engine-exports.txt
+          symbols=(
+            FlutterEngineRun FlutterEngineShutdown FlutterEngineAddView
+            FlutterEngineRemoveView FlutterEngineSendViewFocusEvent
+            FlutterEngineSendWindowMetricsEvent FlutterEngineSendPointerEvent
+            FlutterEngineSendPlatformMessage FlutterEngineSendPlatformMessageResponse
+            FlutterEngineRunTask FlutterEngineScheduleFrame FlutterEngineOnVsync
+            FlutterEngineGetCurrentTime FlutterEngineRunsAOTCompiledDartCode
+            FlutterEngineCreateAOTData FlutterEngineCollectAOTData
+          )
+          for symbol in "${symbols[@]}"; do
+            grep -E "[[:space:]][TW][[:space:]]${symbol}$" /tmp/engine-exports.txt
+          done
 
       - name: Collect libflutter_engine.so
         shell: bash
@@ -559,9 +592,12 @@ jobs:
                   for chunk in iter(lambda: f.read(1024 * 1024), b""):
                       digest.update(chunk)
 
+              checksum = digest.hexdigest()
+              filename = f"libflutter_engine-linux-x64-{mode}-{checksum}.so"
+              path.rename(dist / filename)
               artifacts[mode] = {
                   "file": filename,
-                  "sha256": digest.hexdigest(),
+                  "sha256": checksum,
               }
 
           metadata = {
@@ -586,56 +622,52 @@ jobs:
           echo "Metadata SHA256:"
           sha256sum metadata.json
 
-      # Another workflow could theoretically create this release after
-      # preflight passed but before these builds finished.
-      - name: Check release again
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-        run: |
-          set -euo pipefail
-
-          if gh release view "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            >/dev/null 2>&1
-          then
-            echo "::error::GitHub Release '$RELEASE_TAG' already exists."
-            echo "::error::It was probably created while this workflow was building."
-            exit 1
-          fi
-
-          echo "Release '$RELEASE_TAG' is still available."
-
-      - name: Create GitHub Release
+      - name: Publish libraries, then metadata
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
           FLUTTER_TAG: ${{ needs.preflight.outputs.flutter_tag }}
-          ENGINE_REVISION: ${{ needs.preflight.outputs.engine_revision }}
-          DART_VERSION: ${{ steps.dart.outputs.dart_version }}
+          REPLACE_EXISTING: ${{ inputs.replace_existing }}
         run: |
           set -euo pipefail
 
-          ENGINE_SHORT="${ENGINE_REVISION:0:12}"
+          # Listing errors fail closed; do not mistake API/auth failures for 404.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases" > /tmp/releases.json
+          existing="$(jq -s --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) | first // null' /tmp/releases.json)"
+          if [[ "$existing" != null ]]; then
+            if [[ "$REPLACE_EXISTING" != true ]]; then
+              echo "::error::Release exists; explicit replace_existing is required."
+              exit 1
+            fi
+            draft="$(jq -r '.draft' <<< "$existing")"
+          else
+            # New releases remain private drafts until every asset is uploaded.
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --draft \
+              --title "Flutter Engine $RELEASE_TAG (Flutter $FLUTTER_TAG)" \
+              --notes "Linux x86_64 debug/profile/release embedder builds with Fontconfig. See metadata.json for versions and checksums."
+            draft=true
+          fi
 
-          gh release create "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "Flutter Engine $ENGINE_SHORT (Flutter $FLUTTER_TAG)" \
-            --notes "Flutter Engine builds for Linux.
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' > /tmp/existing-assets.txt
+          mkdir -p /tmp/reused-engine-assets
+          for artifact in dist/*.so; do
+            name="$(basename "$artifact")"
+            if grep -Fxq "$name" /tmp/existing-assets.txt; then
+              # Reuse only byte-identical assets; never clobber an existing SO.
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --pattern "$name" --dir /tmp/reused-engine-assets
+              cmp "$artifact" "/tmp/reused-engine-assets/$name"
+            else
+              gh release upload "$RELEASE_TAG" "$artifact" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
 
-          - Engine revision: \`$ENGINE_REVISION\`
-          - Flutter version: \`$FLUTTER_TAG\`
-          - Dart version: \`$DART_VERSION\`
-          - Architecture: \`x86_64\`
-
-          Included runtime modes:
-          - debug
-          - profile
-          - release" \
-            metadata.json \
-            dist/libflutter_engine-linux-x64-debug.so \
-            dist/libflutter_engine-linux-x64-profile.so \
-            dist/libflutter_engine-linux-x64-release.so
+          # GitHub clobber is delete+upload: a brief metadata availability gap
+          # is possible. Old metadata remains valid because old SOs are retained.
+          gh release upload "$RELEASE_TAG" metadata.json --repo "$GITHUB_REPOSITORY" --clobber
+          if [[ "$draft" == true ]]; then
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi

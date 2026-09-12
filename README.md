@@ -33,9 +33,9 @@ Each Engine release currently contains Linux `x86_64` builds for all three Flutt
 ```text
 metadata.json
 
-libflutter_engine-linux-x64-debug.so
-libflutter_engine-linux-x64-profile.so
-libflutter_engine-linux-x64-release.so
+libflutter_engine-linux-x64-debug-<sha256>.so
+libflutter_engine-linux-x64-profile-<sha256>.so
+libflutter_engine-linux-x64-release-<sha256>.so
 ```
 
 Release tags use the following format:
@@ -67,15 +67,15 @@ Example:
   "artifacts": {
     "x86_64": {
       "debug": {
-        "file": "libflutter_engine-linux-x64-debug.so",
+        "file": "libflutter_engine-linux-x64-debug-<sha256>.so",
         "sha256": "..."
       },
       "profile": {
-        "file": "libflutter_engine-linux-x64-profile.so",
+        "file": "libflutter_engine-linux-x64-profile-<sha256>.so",
         "sha256": "..."
       },
       "release": {
-        "file": "libflutter_engine-linux-x64-release.so",
+        "file": "libflutter_engine-linux-x64-release-<sha256>.so",
         "sha256": "..."
       }
     }
@@ -107,15 +107,18 @@ curl -fL \
   "https://github.com/fushell-poj/fushell-engine-builds/releases/download/engine-${ENGINE_REVISION}/metadata.json"
 ```
 
-A release-mode Linux x64 Engine can then be downloaded from:
+Read the release-mode filename from metadata, then verify its digest:
 
 ```bash
-curl -fL \
-  -o libflutter_engine.so \
-  "https://github.com/fushell-poj/fushell-engine-builds/releases/download/engine-${ENGINE_REVISION}/libflutter_engine-linux-x64-release.so"
+BASE="https://github.com/fushell-poj/fushell-engine-builds/releases/download/engine-${ENGINE_REVISION}"
+curl -fL -o metadata.json "$BASE/metadata.json"
+FILE="$(jq -r '.artifacts.x86_64.release.file' metadata.json)"
+SHA256="$(jq -r '.artifacts.x86_64.release.sha256' metadata.json)"
+curl -fL -o libflutter_engine.so "$BASE/$FILE"
+printf '%s  libflutter_engine.so\n' "$SHA256" | sha256sum --check
 ```
 
-Applications are encouraged to read `metadata.json` instead of constructing artifact filenames manually, and to verify the downloaded file against its published SHA-256 digest.
+Read `metadata.json` instead of constructing artifact filenames: older releases may use the original unhashed names.
 
 ## Fushell integration
 
@@ -154,40 +157,40 @@ Updating the local Flutter SDK does not require rebuilding Fushell solely to upd
 
 ## Building
 
-Engine builds are produced by GitHub Actions.
+Open **Actions → Build Flutter Engine → Run workflow** on the branch containing these changes:
 
-The workflow accepts either:
+- Set `source_type` to `tag` and `source` to the exact Flutter SDK tag reported by `flutter --version`. A full framework commit is also accepted when it resolves unambiguously to a Flutter tag.
+- Leave `publish_release=false` for an artifact-only build. The three libraries are retained as Actions artifacts for one day.
+- Set `publish_release=true` to publish the consumer release. Leave `replace_existing=false` for a new Engine revision; existing releases fail preflight before compilation.
+- To rebuild an already-published revision with Fontconfig, explicitly set both `publish_release=true` and `replace_existing=true`. Review the source and workflow before dispatching.
 
-- a Flutter release tag, such as `3.41.9`
-- a full 40-character Flutter framework commit
+The workflow resolves `bin/internal/engine.version`, verifies the checkout, and builds `host_debug`, `host_profile` and `host_release` in parallel. All modes use the standalone embedder target (from `flutter/engine/src` after dependency setup):
 
-The selected Flutter source is resolved to its exact Engine revision through Flutter's:
-
-```text
-bin/internal/engine.version
+```bash
+./flutter/bin/et build --build-strategy=local --config host_debug \
+  --gn-args=--enable-fontconfig \
+  //flutter/shell/platform/embedder:flutter_engine
 ```
 
-The workflow then checks out the corresponding Flutter source and builds the embedder target in parallel for:
+The Ubuntu runner installs `libfontconfig1-dev`. After each build, ELF inspection requires a `libfontconfig.so` dependency, imported `Fc*` functions, and all 16 Flutter Engine API exports loaded by Fushell. These checks verify linkage and the embedder interface; actual font fallback should still be checked in Fushell after downloading the new build. An older Flutter source without this GN option will fail rather than silently produce an engine without Fontconfig.
+
+Before publishing, each library is renamed to `libflutter_engine-linux-x64-<mode>-<sha256>.so` and its exact name and SHA-256 are written into schema-1 `metadata.json`. No feature flag or consumer schema change is required.
+
+### Existing releases and publication failures
+
+New releases are staged as drafts and published only after all libraries and metadata have uploaded. Workflow runs are serialized to prevent this workflow from publishing concurrently through different Flutter tags for the same Engine revision.
+
+With `replace_existing=true`, new content-addressed libraries upload first; existing libraries are never overwritten or deleted. An already-present hash name is downloaded and compared before reuse. `metadata.json` is replaced last, so old metadata still points to valid old libraries. GitHub's metadata replacement is a delete/upload operation, **not atomic**: downloads may briefly fail, and an interrupted metadata upload can leave metadata unavailable. Rerun with the explicit replacement option to recover; failed new releases may remain drafts. Coordinate with any manual publishers outside this workflow.
+
+### Refreshing a Fushell project cache
+
+Fushell validates its cached Engine against the repository marker (`.repository`) and metadata. Rebuilding the **same Engine revision in the same repository** does not automatically invalidate an already-valid cached library. After the new release is successfully published, close the running application and manually remove only the matching project cache directory:
 
 ```text
-host_debug
-host_profile
-host_release
+<your-project>/build/fushell_flutter_engine/<arch>/<revision>
 ```
 
-using Flutter Engine's `et` tooling.
-
-The resulting libraries are published as:
-
-```text
-libflutter_engine-linux-x64-debug.so
-libflutter_engine-linux-x64-profile.so
-libflutter_engine-linux-x64-release.so
-```
-
-Before publishing, SHA-256 digests are calculated and written into `metadata.json`.
-
-A release is not overwritten if the same Engine revision has already been published.
+For the current builds, `<arch>` is `x86_64` and `<revision>` is the full Engine revision, without the `engine-` prefix. Then rerun the normal Fushell build so it downloads the new metadata and libraries. This repository performs no automatic or global cache deletion. These workflow changes also do not remove any existing font bridge in Fushell; that is separate application work.
 
 ## Supported platforms
 
